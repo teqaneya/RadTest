@@ -1,4 +1,4 @@
-﻿using GMap.NET;
+using GMap.NET;
 using GMap.NET.MapProviders;
 using GMap.NET.WindowsForms;
 using GMap.NET.WindowsForms.Markers;
@@ -11,6 +11,7 @@ using System.Diagnostics;
 using System.Drawing;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
@@ -91,24 +92,25 @@ namespace RobinRadar
         // =========================
         // VISUAL
         // =========================
-        private const int RENDER_FPS_INTERVAL_MS = 50; // lighter
+        private const int RENDER_FPS_INTERVAL_MS = 50;
         private const int UI_DRAIN_INTERVAL_MS = 15;
         private const int UI_DRAIN_BUDGET_MS = 6;
 
         private const int DOT_SIZE_MEAS = 10;
         private const int DOT_SIZE_MID = 6;
         private const int DOT_SIZE_CURRENT = 15;
+        private const int DOT_SIZE_KF = 8; // حجم نقاط الكالمان
 
-        private const bool DRAW_MIDPOINTS = true;
+        private const bool DRAW_MIDPOINTS = false; // تم تعطيل رسم الميد بوينت
         private const bool DRAW_CURRENT_MARKER = true;
 
         // =========================
         // 100ms PREDICTION
         // =========================
         private const int PRED_TICK_MS = 100;
-        private const double PRED_STEP_SEC = 0.100;        // fixed integration step
-        private const int PRED_TICK_BUDGET_MS = 6;         // UI safety
-        private const int ACTIVE_TARGET_TTL_MS = 3000;     // predict only “recent” targets
+        private const double PRED_STEP_SEC = 0.100;
+        private const int PRED_TICK_BUDGET_MS = 6;
+        private const int ACTIVE_TARGET_TTL_MS = 3000;
 
         // =========================
         // KALMAN
@@ -122,10 +124,9 @@ namespace RobinRadar
         private const double KF_ACCEL_SIGMA_MPS2 = 4.0;
 
         private const bool KF_INJECT_MEAS_VELOCITY = true;
-        private const double KF_VEL_INJECT_BLEND = 0.35;  // 0..1
+        private const double KF_VEL_INJECT_BLEND = 0.35;
         private const double KF_VEL_CLAMP_MPS = 45.0;
 
-        // Route: only on measurements (fast + clean)
         private const bool KF_ROUTE_ON_MEASUREMENTS_ONLY = true;
         private const int KF_ROUTE_MAX_POINTS = 30000;
 
@@ -151,6 +152,7 @@ namespace RobinRadar
         private Bitmap _dotMidBmp;
         private Bitmap _dotCurrentBmp;
         private Bitmap _dotKfCurrentBmp;
+        private Bitmap _dotKfBmp; // نقاط الكالمان
 
         // =========================
         // SENSOR
@@ -185,8 +187,8 @@ namespace RobinRadar
         private readonly Dictionary<string, GMapMarker> _kfMarkerById =
             new Dictionary<string, GMapMarker>(StringComparer.Ordinal);
 
-        private readonly Dictionary<string, GMarkerGoogle[]> _kfMarkersById =
-            new Dictionary<string, GMarkerGoogle[]>(StringComparer.Ordinal);
+        private readonly Dictionary<string, List<GMarkerGoogle>> _kfMarkersById =
+            new Dictionary<string, List<GMarkerGoogle>>(StringComparer.Ordinal);
 
         private readonly Dictionary<string, PointLatLng> _kfLastMeasPosById =
             new Dictionary<string, PointLatLng>(StringComparer.Ordinal);
@@ -201,7 +203,6 @@ namespace RobinRadar
         private readonly Dictionary<string, LastMeasEnu> _kfLastMeasEnuById =
             new Dictionary<string, LastMeasEnu>(StringComparer.Ordinal);
 
-        // Active + prediction accumulators (deterministic stepping)
         private readonly Dictionary<string, DateTime> _activeUntilUtcById =
             new Dictionary<string, DateTime>(StringComparer.Ordinal);
 
@@ -218,8 +219,8 @@ namespace RobinRadar
 
         private sealed class Message
         {
-            public DateTime ArrivalUtc;   // trusted ordering for Ethernet
-            public DateTime FileTsUtc;    // for Simulation pacing (if available)
+            public DateTime ArrivalUtc;
+            public DateTime FileTsUtc;
 
             public bool HasGps;
             public double SensorLat, SensorLon;
@@ -247,7 +248,6 @@ namespace RobinRadar
 
         private void Form1_Load(object sender, EventArgs e)
         {
-            // Deterministic culture
             var inv = CultureInfo.InvariantCulture;
             CultureInfo.DefaultThreadCurrentCulture = inv;
             CultureInfo.DefaultThreadCurrentUICulture = inv;
@@ -257,10 +257,11 @@ namespace RobinRadar
             InitMap();
 
             _robinBmp = TryLoadSensorBitmap();
-            _dotMeasBmp = CreateDotBitmap(Color.LimeGreen, DOT_SIZE_MEAS);
+            _dotMeasBmp = CreateDotBitmap(Color.Red, DOT_SIZE_MEAS); // تغيير اللون إلى الأحمر
             _dotMidBmp = CreateDotBitmap(Color.DarkGreen, DOT_SIZE_MID);
             _dotCurrentBmp = CreateRingDotBitmap(Color.Cyan, Color.Black, DOT_SIZE_CURRENT);
             _dotKfCurrentBmp = CreateRingDotBitmap(Color.Yellow, Color.Black, DOT_SIZE_CURRENT);
+            _dotKfBmp = CreateDotBitmap(Color.DodgerBlue, DOT_SIZE_KF); // نقاط الكالمان باللون الأزرق
 
             GridView.AutoGenerateColumns = true;
             GridView.DataSource = _gridList;
@@ -291,7 +292,6 @@ namespace RobinRadar
         {
             try
             {
-                // Ask to save only if there is data
                 if (GridView.Rows.Count > 0)
                 {
                     var result = MessageBox.Show(
@@ -340,9 +340,7 @@ namespace RobinRadar
                     MessageBoxIcon.Error);
             }
 
-            // ---- your existing shutdown logic ----
             try { _cts?.Cancel(); } catch { }
-
             try { _uiDrainTimer?.Stop(); } catch { }
             try { _renderTimer?.Stop(); } catch { }
             try { _predTimer?.Stop(); } catch { }
@@ -352,13 +350,13 @@ namespace RobinRadar
             SafeDispose(ref _dotMidBmp);
             SafeDispose(ref _dotCurrentBmp);
             SafeDispose(ref _dotKfCurrentBmp);
+            SafeDispose(ref _dotKfBmp);
         }
 
         private static void SaveDataGridViewToCsv(DataGridView dgv, string filePath)
         {
             var sb = new StringBuilder(1024 * 1024);
 
-            // Header
             bool first = true;
             foreach (DataGridViewColumn col in dgv.Columns)
             {
@@ -370,7 +368,6 @@ namespace RobinRadar
             }
             sb.AppendLine();
 
-            // Rows
             foreach (DataGridViewRow row in dgv.Rows)
             {
                 if (row.IsNewRow) continue;
@@ -412,10 +409,6 @@ namespace RobinRadar
             return mustQuote ? $"\"{s}\"" : s;
         }
 
-
-        // =========================================================
-        // RESET
-        // =========================================================
         private void ResetAll()
         {
             _gridList.Clear();
@@ -449,9 +442,6 @@ namespace RobinRadar
             while (_msgQueue.TryDequeue(out _)) { }
         }
 
-        // =========================================================
-        // MAP INIT
-        // =========================================================
         private void InitMap()
         {
             GMaps.Instance.Mode = AccessMode.ServerAndCache;
@@ -504,9 +494,6 @@ namespace RobinRadar
             map.Zoom = _zoomValue;
         }
 
-        // =========================================================
-        // RENDER TIMER
-        // =========================================================
         private void StartMapRenderTimer()
         {
             _renderTimer = new System.Windows.Forms.Timer();
@@ -519,9 +506,6 @@ namespace RobinRadar
             _renderTimer.Start();
         }
 
-        // =========================================================
-        // UI DRAIN TIMER (Ethernet)
-        // =========================================================
         private void StartUiDrainTimer()
         {
             _uiDrainTimer = new System.Windows.Forms.Timer();
@@ -538,9 +522,6 @@ namespace RobinRadar
             _uiDrainTimer.Start();
         }
 
-        // =========================================================
-        // 100ms PREDICTION TIMER
-        // =========================================================
         private void StartPredictionTimer()
         {
             _predTimer = new System.Windows.Forms.Timer();
@@ -557,7 +538,6 @@ namespace RobinRadar
             DateTime now = DateTime.UtcNow;
             var sw = Stopwatch.StartNew();
 
-            // Deterministic order: sort IDs
             var ids = new List<string>(_kfById.Keys);
             ids.Sort(StringComparer.Ordinal);
 
@@ -567,14 +547,12 @@ namespace RobinRadar
 
                 string id = ids[i];
 
-                // Active gate
                 if (!_activeUntilUtcById.TryGetValue(id, out var until) || now > until)
                     continue;
 
                 if (!_kfById.TryGetValue(id, out var kf)) continue;
                 if (!_frameById.TryGetValue(id, out var frame)) continue;
 
-                // dt from wall time (per target)
                 if (!_predLastWallUtcById.TryGetValue(id, out var lastWall))
                 {
                     _predLastWallUtcById[id] = now;
@@ -588,14 +566,12 @@ namespace RobinRadar
                 if (dtWall < 0) dtWall = 0;
                 if (dtWall > 0.5) dtWall = 0.5;
 
-                // In simulation playback, wall time is compressed, so convert to data time
                 double dtData = (MODE == DataMode.SimulationFile) ? (dtWall / Math.Max(1e-6, SIM_TIME_SCALE)) : dtWall;
 
                 double acc = 0.0;
                 _predAccumSecById.TryGetValue(id, out acc);
                 acc += dtData;
 
-                // Fixed-step integration
                 int steps = 0;
                 while (acc >= PRED_STEP_SEC && steps < 6)
                 {
@@ -606,7 +582,6 @@ namespace RobinRadar
 
                 _predAccumSecById[id] = acc;
 
-                // Move KF marker
                 frame.EnuToLlh(kf.X, kf.Y, 0.0, out double lat, out double lon, out _);
                 if (!IsValidLatLon(lat, lon)) continue;
 
@@ -614,9 +589,6 @@ namespace RobinRadar
             }
         }
 
-        // =========================================================
-        // ETHERNET PRODUCER (no UI work)
-        // =========================================================
         private async Task EthernetProducerLoop(CancellationToken ct)
         {
             while (!ct.IsCancellationRequested)
@@ -657,7 +629,6 @@ namespace RobinRadar
                                         Tracks = ParseRobinMessage(robinXml)
                                     };
 
-                                    // Ethernet: force track timestamps to arrival time
                                     if (msg.Tracks != null)
                                     {
                                         for (int t = 0; t < msg.Tracks.Count; t++)
@@ -679,9 +650,6 @@ namespace RobinRadar
             }
         }
 
-        // =========================================================
-        // SIMULATION PLAYBACK LOOP (no UI drain timer needed)
-        // =========================================================
         private async Task SimulationPlaybackLoop(CancellationToken ct)
         {
             while (!ct.IsCancellationRequested)
@@ -720,7 +688,7 @@ namespace RobinRadar
 
                     var msg = new Message
                     {
-                        ArrivalUtc = DateTime.UtcNow,   // used for active TTL only
+                        ArrivalUtc = DateTime.UtcNow,
                         FileTsUtc = fileTs,
                         HasGps = TryParseSystemStatusGps(robinXml, out double sLat, out double sLon),
                         SensorLat = sLat,
@@ -728,7 +696,6 @@ namespace RobinRadar
                         Tracks = ParseRobinMessage(robinXml)
                     };
 
-                    // Simulation: set track timestamps to file time if available
                     if (msg.Tracks != null && fileTs != DateTime.MinValue)
                     {
                         for (int t = 0; t < msg.Tracks.Count; t++)
@@ -779,9 +746,6 @@ namespace RobinRadar
             }
         }
 
-        // =========================================================
-        // APPLY MESSAGE (UI thread)
-        // =========================================================
         private void ApplyMessageOnUi(Message msg)
         {
             if (msg == null) return;
@@ -791,9 +755,6 @@ namespace RobinRadar
 
             if (msg.Tracks != null && msg.Tracks.Count > 0)
             {
-                // Use different time semantics per mode:
-                // Ethernet: msg.ArrivalUtc (already assigned into tracks)
-                // Simulation: msg.FileTsUtc (assigned if available)
                 DateTime measTime = (MODE == DataMode.SimulationFile && msg.FileTsUtc != DateTime.MinValue)
                     ? msg.FileTsUtc
                     : msg.ArrivalUtc;
@@ -843,7 +804,6 @@ namespace RobinRadar
                 if (!PassClassFilter(s.Classification)) continue;
                 if (!IsValidLatLon(s.LatitudeDeg, s.LongitudeDeg)) continue;
 
-                // Force measurement time for determinism in UI/KF
                 s.TimestampUtc = measTimeUtc;
 
                 _gridList.Add(s);
@@ -852,7 +812,6 @@ namespace RobinRadar
                 if (_gridList.Count > GRID_MAX_ROWS)
                     _gridList.RemoveAt(0);
 
-                // Active TTL: based on wall time
                 _activeUntilUtcById[s.TargetId] = DateTime.UtcNow.AddMilliseconds(ACTIVE_TARGET_TTL_MS);
             }
 
@@ -862,9 +821,6 @@ namespace RobinRadar
                 ApplyKalmanMeasurementUpdates(accepted, measTimeUtc);
         }
 
-        // =========================================================
-        // MEASURED DRAW
-        // =========================================================
         private void DrawMeasured(List<TrackSample> accepted)
         {
             if (accepted == null || accepted.Count == 0) return;
@@ -876,17 +832,11 @@ namespace RobinRadar
 
                 var cur = new PointLatLng(s.LatitudeDeg, s.LongitudeDeg);
 
-                if (DRAW_MIDPOINTS && _lastPosByTargetId.TryGetValue(s.TargetId, out var prev))
-                {
-                    var mid = GreatCircleMidpoint(prev, cur);
-                    var midMarker = new GMarkerGoogle(mid, _dotMidBmp)
-                    {
-                        ToolTipMode = MarkerTooltipMode.OnMouseOver,
-                        ToolTipText = "MID (meas)\nID=" + s.TargetId
-                    };
-                    _midpointOverlay.Markers.Add(midMarker);
-                    if (map.IsHandleCreated) map.UpdateMarkerLocalPosition(midMarker);
-                }
+                // تم حذف رسم الميد بوينت
+                // if (DRAW_MIDPOINTS && _lastPosByTargetId.TryGetValue(s.TargetId, out var prev))
+                // {
+                //     ...
+                // }
 
                 var measMarker = new GMarkerGoogle(cur, _dotMeasBmp)
                 {
@@ -930,9 +880,6 @@ namespace RobinRadar
             if (map.IsHandleCreated) map.UpdateMarkerLocalPosition(m);
         }
 
-        // =========================================================
-        // KALMAN MEASUREMENT UPDATES (NO PREDICT HERE)
-        // =========================================================
         private void ApplyKalmanMeasurementUpdates(List<TrackSample> accepted, DateTime measTimeUtc)
         {
             if (accepted == null || accepted.Count == 0) return;
@@ -948,7 +895,6 @@ namespace RobinRadar
                 double alt = (!double.IsNaN(s.AltitudeM) ? s.AltitudeM : 0.0);
                 frame.LlhToEnu(s.LatitudeDeg, s.LongitudeDeg, alt, out double zx, out double zy, out _);
 
-                // Midpoint pseudo-measurement (down-weighted)
                 if (KF_USE_MIDPOINT_PSEUDO_MEAS && _kfLastMeasPosById.TryGetValue(s.TargetId, out var prevPos))
                 {
                     var mid = GreatCircleMidpoint(prevPos, new PointLatLng(s.LatitudeDeg, s.LongitudeDeg));
@@ -956,10 +902,8 @@ namespace RobinRadar
                     kf.Update(mx, my, KF_MEAS_SIGMA_M * KF_MID_SIGMA_MULT);
                 }
 
-                // Real measurement update
                 kf.Update(zx, zy, KF_MEAS_SIGMA_M);
 
-                // Velocity injection from last two measurements (helps 100ms prediction)
                 if (KF_INJECT_MEAS_VELOCITY)
                 {
                     if (_kfLastMeasEnuById.TryGetValue(s.TargetId, out var last) && last.Has)
@@ -982,7 +926,6 @@ namespace RobinRadar
 
                 _kfLastMeasPosById[s.TargetId] = new PointLatLng(s.LatitudeDeg, s.LongitudeDeg);
 
-                // Fill grid KF columns
                 frame.EnuToLlh(kf.X, kf.Y, 0.0, out double flat, out double flon, out _);
                 s.KfLatDeg = flat;
                 s.KfLonDeg = flon;
@@ -997,18 +940,13 @@ namespace RobinRadar
                 }
                 else s.KfHeadingDeg = null;
 
-                // Ensure KF marker exists immediately
                 UpsertKfMarker(s.TargetId, new PointLatLng(flat, flon), kf);
 
-                // Route on measurement only
                 if (KF_ROUTE_ON_MEASUREMENTS_ONLY)
                     UpsertKfMarkers(s.TargetId, new PointLatLng(flat, flon));
             }
         }
 
-        // =========================================================
-        // KF marker + route
-        // =========================================================
         private void UpsertKfMarker(string id, PointLatLng pos, KalmanCv2D kf)
         {
             if (_kfCurrentOverlay == null) return;
@@ -1036,12 +974,12 @@ namespace RobinRadar
 
             if (!_kfMarkersById.TryGetValue(id, out var markers))
             {
-                markers = new GMarkerGoogle[] { };
+                markers = new List<GMarkerGoogle>();
                 _kfMarkersById[id] = markers;
             }
 
-            // Create marker (you can swap type or style here)
-            var marker = new GMarkerGoogle(p, GMarkerGoogleType.small)
+            // رسم نقاط الكالمان بدلاً من الخطوط
+            var marker = new GMarkerGoogle(p, _dotKfBmp)
             {
                 ToolTipText = $"KF {id}",
                 ToolTipMode = MarkerTooltipMode.OnMouseOver
@@ -1050,7 +988,6 @@ namespace RobinRadar
             markers.Add(marker);
             _kfOverlay.Markers.Add(marker);
 
-            // Enforce max history
             if (markers.Count > KF_ROUTE_MAX_POINTS)
             {
                 int removeCount = markers.Count - KF_ROUTE_MAX_POINTS;
@@ -1062,7 +999,7 @@ namespace RobinRadar
             }
 
             if (map.IsHandleCreated)
-                map.Refresh(); // markers don't need UpdateRouteLocalPosition
+                map.UpdateMarkerLocalPosition(marker);
         }
 
         private static void TrimOverlayMarkers(GMapOverlay ov, int max)
@@ -1075,9 +1012,6 @@ namespace RobinRadar
                 ov.Markers.RemoveAt(0);
         }
 
-        // =========================================================
-        // Frame + KF creation
-        // =========================================================
         private LocalFrameEnu GetOrCreateFrame(string id, TrackSample s)
         {
             if (_frameById.TryGetValue(id, out var f)) return f;
@@ -1116,9 +1050,6 @@ namespace RobinRadar
             return kf;
         }
 
-        // =========================================================
-        // Midpoint (great-circle)
-        // =========================================================
         private static PointLatLng GreatCircleMidpoint(PointLatLng p1, PointLatLng p2)
         {
             double φ1 = ToRad(p1.Lat);
@@ -1150,9 +1081,6 @@ namespace RobinRadar
         private static double ToRad(double deg) => deg * (Math.PI / 180.0);
         private static double ToDeg(double rad) => rad * (180.0 / Math.PI);
 
-        // =========================================================
-        // SIM helpers
-        // =========================================================
         private static List<string> ExtractRobinBlocks(string text)
         {
             var list = new List<string>();
@@ -1213,9 +1141,6 @@ namespace RobinRadar
             return false;
         }
 
-        // =========================================================
-        // XML parsing
-        // =========================================================
         public static List<TrackSample> ParseRobinMessage(string robinXml)
         {
             var list = new List<TrackSample>();
@@ -1267,7 +1192,6 @@ namespace RobinRadar
 
                     if (Eq(name, "Timestamp"))
                     {
-                        // Parsed only for Simulation pacing; Ethernet overrides timestamps anyway
                         string s = sub.ReadElementContentAsString();
                         if (!string.IsNullOrWhiteSpace(s) && TryParseToUtc(s, out DateTime utc))
                             t.TimestampUtc = utc;
@@ -1343,7 +1267,6 @@ namespace RobinRadar
             return true;
         }
 
-        // SystemStatus GPS (lat/lon)
         public static bool TryParseSystemStatusGps(string robinXml, out double lat, out double lon)
         {
             lat = lon = double.NaN;
@@ -1390,9 +1313,6 @@ namespace RobinRadar
             return true;
         }
 
-        // =========================================================
-        // UI helper
-        // =========================================================
         private void SafeInvoke(Action a)
         {
             try
@@ -1417,9 +1337,6 @@ namespace RobinRadar
             return v;
         }
 
-        // =========================================================
-        // Bitmap helpers
-        // =========================================================
         private static void SafeDispose(ref Bitmap bmp)
         {
             try { bmp?.Dispose(); } catch { }
@@ -1485,11 +1402,6 @@ namespace RobinRadar
             return bmp;
         }
 
-     
-
-        // =========================================================
-        // Local ENU frame (WGS84)
-        // =========================================================
         private sealed class LocalFrameEnu
         {
             private const double A = 6378137.0;
